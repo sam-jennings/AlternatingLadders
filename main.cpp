@@ -55,6 +55,7 @@ struct Settings {
     int reserve_capacity = 0;
     bool ace_grace = false;
     bool market_enabled = false;
+    bool skip_forced_discard = false;
     uint64_t seed = 42;
     bool trace = false;
 };
@@ -74,6 +75,8 @@ struct GameState {
     std::array<int, 2> next_needed;  // next required rank per colour
     bool ace_started = false;        // has any Ace been played?
     int turns = 0;                   // number of turns elapsed
+    std::array<int, 2> hand_limit;   // dynamic per-player hand limits
+    int consecutive_skips = 0;       // consecutive skip-forced turns
 };
 
 // Utility: remove a card id from a vector (order is not preserved but we keep
@@ -138,11 +141,13 @@ GameState initialise_game(const Settings& cfg, std::mt19937_64& rng) {
     state.next_needed = {1, 1};
     state.ace_started = false;
     state.turns = 0;
+    state.hand_limit = {cfg.hand_size, cfg.hand_size};
+    state.consecutive_skips = 0;
 
     // Initial draw up to hand size from each deck.
     for (int p = 0; p < 2; ++p) {
         while (!state.deck[p].empty() &&
-               static_cast<int>(state.hand[p].size()) < cfg.hand_size) {
+               static_cast<int>(state.hand[p].size()) < state.hand_limit[p]) {
             int card_id = state.deck[p].back();
             state.deck[p].pop_back();
             state.hand[p].push_back(card_id);
@@ -154,8 +159,12 @@ GameState initialise_game(const Settings& cfg, std::mt19937_64& rng) {
 }
 
 // Helper that draws one card for player p if possible.
-int draw_one(GameState& state, int player) {
+int draw_one(GameState& state, int player, bool ignore_limit = false) {
     if (state.deck[player].empty()) {
+        return -1;
+    }
+    if (!ignore_limit &&
+        static_cast<int>(state.hand[player].size()) >= state.hand_limit[player]) {
         return -1;
     }
     int card_id = state.deck[player].back();
@@ -168,9 +177,11 @@ int draw_one(GameState& state, int player) {
 // Draw until the hand reaches the configured size (used after playing a card
 // from hand).
 void refill_hand(GameState& state, int player) {
-    while (static_cast<int>(state.hand[player].size()) < state.cfg->hand_size &&
+    while (static_cast<int>(state.hand[player].size()) < state.hand_limit[player] &&
            !state.deck[player].empty()) {
-        draw_one(state, player);
+        if (draw_one(state, player) < 0) {
+            break;
+        }
     }
 }
 
@@ -232,13 +243,13 @@ std::optional<std::pair<int, int>> detect_unwinnable(const GameState& state) {
 
 // Check whether the current player has an immediate legal play from hand or
 // shared areas (reserve/market).
-bool can_play_now(const GameState& state, int player) {
+bool can_play_now(const GameState& state, int player, bool allow_market) {
     for (int color = 0; color < 2; ++color) {
         int rank = state.next_needed[color];
         if (rank > 13) {
             continue;
         }
-        if (state.cfg->market_enabled) {
+        if (allow_market) {
             const auto& pile = state.market[market_index(color, rank)];
             if (!pile.empty()) {
                 return true;
@@ -273,14 +284,15 @@ struct PlayCandidate {
 //   2. market before reserve before hand
 //   3. colour tie-breaker (red before black)
 //   4. owner A before B (useful when both copies appear in market/reserve)
-void play_from_best_source(GameState& state, int player, std::string& action) {
+void play_from_best_source(GameState& state, int player, bool allow_market,
+                           std::string& action) {
     std::vector<PlayCandidate> candidates;
     for (int color = 0; color < 2; ++color) {
         int rank = state.next_needed[color];
         if (rank > 13) {
             continue;
         }
-        if (state.cfg->market_enabled) {
+        if (allow_market) {
             auto idx = market_index(color, rank);
             for (int card_id : state.market[idx]) {
                 const Card& c = state.cards[card_id];
@@ -539,7 +551,7 @@ void discard_to_trash(GameState& state, int player, int card_id, std::string& ac
         state.locations[card_id] = {LocationType::Trash, -1};
         action = "discard " + card_to_string(state.cards[card_id]) + " to trash";
     }
-    if (static_cast<int>(state.hand[player].size()) < state.cfg->hand_size) {
+    if (static_cast<int>(state.hand[player].size()) < state.hand_limit[player]) {
         int drawn = draw_one(state, player);
         if (drawn >= 0) {
             action += " (drew " + card_to_string(state.cards[drawn]) + ")";
@@ -648,30 +660,96 @@ TrialResult play_single_game(const Settings& cfg, std::mt19937_64& rng, bool tra
         std::string preface = "Turn " + std::to_string(state.turns) +
                               " (Player " + (current_player == 0 ? "A" : "B") + ")";
 
-        if (can_play_now(state, current_player)) {
-            play_from_best_source(state, current_player, action);
-        } else if (cfg.ace_grace && !state.ace_started) {
-            if (!state.deck[current_player].empty()) {
-                int drawn = draw_one(state, current_player);
-                if (drawn >= 0) {
-                    action = "pass (ace grace, drew " +
-                             card_to_string(state.cards[drawn]) + ")";
-                } else {
-                    action = "pass (ace grace, deck empty)";
-                }
-            } else {
-                action = "pass (ace grace, deck empty)";
-            }
+        bool market_allowed = state.cfg->market_enabled;
+        if (state.cfg->skip_forced_discard && state.cfg->market_enabled &&
+            state.consecutive_skips == 1) {
+            market_allowed = false;
+        }
+
+        bool action_was_skip = false;
+        bool action_performed = false;
+
+        if (can_play_now(state, current_player, market_allowed)) {
+            play_from_best_source(state, current_player, market_allowed, action);
+            action_performed = true;
         } else {
-            bool moved_to_reserve = protect_future_rank(state, current_player, action);
-            if (!moved_to_reserve) {
-                int discard_id = choose_discard(state, current_player);
-                if (discard_id >= 0) {
-                    discard_to_trash(state, current_player, discard_id, action);
-                } else {
-                    action = "pass (hand empty)";
+            bool ace_grace_used = false;
+            if (cfg.ace_grace && !state.ace_started) {
+                if (!state.deck[current_player].empty() &&
+                    static_cast<int>(state.hand[current_player].size()) <
+                        state.hand_limit[current_player]) {
+                    int drawn = draw_one(state, current_player);
+                    if (drawn >= 0) {
+                        action = "pass (ace grace, drew " +
+                                 card_to_string(state.cards[drawn]) + ")";
+                        ace_grace_used = true;
+                        action_performed = true;
+                    }
                 }
             }
+
+            if (!ace_grace_used) {
+                bool moved_to_reserve =
+                    protect_future_rank(state, current_player, action);
+                if (moved_to_reserve) {
+                    action_performed = true;
+                } else {
+                    int discard_id = choose_discard(state, current_player);
+                    if (discard_id >= 0) {
+                        bool skip_due_to_forced = false;
+                        if (cfg.skip_forced_discard) {
+                            const Card& candidate = state.cards[discard_id];
+                            skip_due_to_forced = other_copy_in_trash(
+                                state, candidate.color, candidate.rank,
+                                candidate.owner);
+                        }
+                        if (skip_due_to_forced) {
+                            const Card& candidate = state.cards[discard_id];
+                            action = "skip (protect " +
+                                     card_to_string(candidate) + ")";
+                            if (cfg.market_enabled) {
+                                int previous_limit =
+                                    state.hand_limit[current_player];
+                                if (previous_limit > 1) {
+                                    state.hand_limit[current_player] =
+                                        previous_limit - 1;
+                                    action += " (hand limit now " +
+                                              std::to_string(
+                                                  state.hand_limit
+                                                      [current_player]) +
+                                              ")";
+                                } else {
+                                    action += " (hand limit already minimal)";
+                                }
+                            } else {
+                                int drawn = draw_one(state, current_player, true);
+                                if (drawn >= 0) {
+                                    action += " (drew " +
+                                              card_to_string(state.cards[drawn]) +
+                                              ")";
+                                } else if (state.deck[current_player].empty()) {
+                                    action += " (deck empty)";
+                                }
+                            }
+                            action_performed = true;
+                            action_was_skip = true;
+                        } else {
+                            discard_to_trash(state, current_player, discard_id,
+                                             action);
+                            action_performed = true;
+                        }
+                    } else {
+                        action = "pass (hand empty)";
+                        action_performed = true;
+                    }
+                }
+            }
+        }
+
+        if (action_was_skip) {
+            state.consecutive_skips++;
+        } else if (action_performed) {
+            state.consecutive_skips = 0;
         }
 
         trace_state(preface, action);
@@ -721,6 +799,9 @@ Settings parse_args(int argc, char** argv) {
         } else if (arg == "--market") {
             require_value(arg);
             cfg.market_enabled = std::stoi(argv[++i]) != 0;
+        } else if (arg == "--skip") {
+            require_value(arg);
+            cfg.skip_forced_discard = std::stoi(argv[++i]) != 0;
         } else if (arg == "--seed") {
             require_value(arg);
             cfg.seed = static_cast<uint64_t>(std::stoull(argv[++i]));
@@ -734,6 +815,7 @@ Settings parse_args(int argc, char** argv) {
                          "  --reserve R      reserve capacity (default 0)\n"
                          "  --ace-grace 0/1  enable Ace grace (default 0)\n"
                          "  --market 0/1     enable reclaimable market (default 0)\n"
+                         "  --skip 0/1       skip instead of forced discard (default 0)\n"
                          "  --seed S         RNG seed (default 42)\n"
                          "  --trace 0/1      verbose single game trace (default 0)\n";
             std::exit(0);
@@ -814,6 +896,7 @@ int main(int argc, char** argv) {
               << " reserve=" << cfg.reserve_capacity
               << " ace_grace=" << (cfg.ace_grace ? 1 : 0)
               << " market=" << (cfg.market_enabled ? 1 : 0)
+              << " skip=" << (cfg.skip_forced_discard ? 1 : 0)
               << " seed=" << cfg.seed << "\n";
 
     long double completable = static_cast<long double>(successes) / cfg.trials;
