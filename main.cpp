@@ -917,6 +917,20 @@ int main(int argc, char** argv) {
               << " skip=" << (cfg.skip_forced_discard ? 1 : 0)
               << " seed=" << cfg.seed << "\n";
 
+    long double mean_skips = sum_skips / cfg.trials;
+    long double mean_skip_ratio = sum_skip_ratios / cfg.trials;
+    long double overall_skip_fraction =
+        sum_turns > 0 ? sum_skips / sum_turns : 0.0L;
+
+    std::ostringstream skip_stats;
+    skip_stats << std::fixed;
+    skip_stats << " mean_skips=" << std::setprecision(2)
+               << static_cast<double>(mean_skips);
+    skip_stats << " mean_skip_ratio=" << std::setprecision(4)
+               << static_cast<double>(mean_skip_ratio);
+    skip_stats << " overall_skip_fraction="
+               << static_cast<double>(overall_skip_fraction);
+
     long double completable = static_cast<long double>(successes) / cfg.trials;
     long double winnable_rate = completable;  // identical because we stop on failure
     std::cout << std::fixed << std::setprecision(4);
@@ -925,7 +939,8 @@ int main(int argc, char** argv) {
               << " mean_turns=" << std::setprecision(2) << static_cast<double>(mean)
               << " sd=" << static_cast<double>(sd) << std::setprecision(4)
               << " p50=" << quantile(0.5)
-              << " p90=" << quantile(0.9) << "\n";
+              << " p90=" << quantile(0.9)
+              << skip_stats.str() << "\n";
 
     long double mean_skips = sum_skips / cfg.trials;
     long double mean_skip_ratio = sum_skip_ratios / cfg.trials;
