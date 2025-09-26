@@ -72,10 +72,9 @@ struct GameState {
     std::array<std::vector<int>, 28> market;  // [color*14 + rank], ranks 1..13 used
     std::vector<int> trash;                   // irretrievable discards
 
-    std::array<int, 2> next_needed;  // next required rank per colour/ladder
-    std::array<int, 2> ladder_direction;  // +1 ascending from Ace, -1 descending from King, 0 undecided
-    std::array<bool, 2> ladder_started;   // has the ladder for this colour begun?
-    std::array<int, 2> forced_start;      // required initial rank when ladder not yet started (0 = free choice)
+    std::array<int, 2> next_needed;       // next required rank per ladder
+    std::array<int, 2> ladder_direction;  // +1 ascending from Ace, -1 descending from King
+    std::array<bool, 2> ladder_started;   // has the ladder for this sequence begun?
     bool ace_started = false;        // has any Ace been played?
     int turns = 0;                   // number of turns elapsed
     std::array<int, 2> hand_limit;   // dynamic per-player hand limits
@@ -83,51 +82,55 @@ struct GameState {
     int total_skips = 0;             // total skips executed this game
 };
 
-bool ladder_completed(const GameState& state, int color) {
-    if (!state.ladder_started[color]) {
+int expected_color_for(int ladder, int rank) {
+    bool odd = (rank % 2) == 1;
+    if (ladder == 0) {
+        return odd ? 0 : 1;  // ascending ladder: odd ranks red, even ranks black
+    }
+    return odd ? 1 : 0;      // descending ladder: odd ranks black, even ranks red
+}
+
+int ladder_for(int color, int rank) {
+    bool odd = (rank % 2) == 1;
+    if (color == 0) {
+        return odd ? 0 : 1;
+    }
+    return odd ? 1 : 0;
+}
+
+bool ladder_completed(const GameState& state, int ladder) {
+    if (!state.ladder_started[ladder]) {
         return false;
     }
-    if (state.ladder_direction[color] > 0) {
-        return state.next_needed[color] > 13;
+    if (state.ladder_direction[ladder] > 0) {
+        return state.next_needed[ladder] > 13;
     }
-    return state.next_needed[color] < 1;
+    return state.next_needed[ladder] < 1;
 }
 
 std::vector<int> current_required_ranks(const GameState& state, int color) {
-    if (ladder_completed(state, color)) {
-        return {};
+    std::vector<int> ranks;
+    for (int ladder = 0; ladder < 2; ++ladder) {
+        if (ladder_completed(state, ladder)) {
+            continue;
+        }
+        int next = state.next_needed[ladder];
+        if (next < 1 || next > 13) {
+            continue;
+        }
+        if (expected_color_for(ladder, next) == color) {
+            ranks.push_back(next);
+        }
     }
-    if (state.ladder_started[color]) {
-        return {state.next_needed[color]};
-    }
-    if (state.forced_start[color] != 0) {
-        return {state.forced_start[color]};
-    }
-    return {1, 13};
+    return ranks;
 }
 
 std::vector<int> remaining_ranks(const GameState& state, int color) {
     std::vector<int> ranks;
-    if (ladder_completed(state, color)) {
-        return ranks;
-    }
-    if (state.ladder_started[color]) {
-        if (state.ladder_direction[color] > 0) {
-            for (int r = state.next_needed[color]; r <= 13; ++r) {
-                ranks.push_back(r);
-            }
-        } else {
-            for (int r = state.next_needed[color]; r >= 1; --r) {
-                ranks.push_back(r);
-            }
-        }
-    } else {
-        if (state.forced_start[color] == 13) {
-            for (int r = 13; r >= 1; --r) {
-                ranks.push_back(r);
-            }
-        } else {
-            for (int r = 1; r <= 13; ++r) {
+    for (int ladder = 0; ladder < 2; ++ladder) {
+        int next = state.next_needed[ladder];
+        for (int r = next; r >= 1 && r <= 13; r += state.ladder_direction[ladder]) {
+            if (expected_color_for(ladder, r) == color) {
                 ranks.push_back(r);
             }
         }
@@ -148,66 +151,36 @@ bool is_future_need(const GameState& state, int color, int rank) {
     if (rank < 1 || rank > 13) {
         return false;
     }
-    if (ladder_completed(state, color)) {
-        return false;
-    }
-    if (state.ladder_started[color]) {
-        if (state.ladder_direction[color] > 0) {
-            return rank >= state.next_needed[color];
+    for (int ladder = 0; ladder < 2; ++ladder) {
+        int next = state.next_needed[ladder];
+        for (int r = next; r >= 1 && r <= 13; r += state.ladder_direction[ladder]) {
+            if (expected_color_for(ladder, r) == color && r == rank) {
+                return true;
+            }
         }
-        return rank <= state.next_needed[color];
     }
-    if (state.forced_start[color] == 13) {
-        return rank <= 13;
-    }
-    return rank >= 1;
+    return false;
 }
 
 int progress_metric(const GameState& state, int color) {
-    if (!state.ladder_started[color]) {
-        if (state.forced_start[color] == 13) {
-            return 1;
+    int remaining = 0;
+    for (int ladder = 0; ladder < 2; ++ladder) {
+        int next = state.next_needed[ladder];
+        for (int r = next; r >= 1 && r <= 13; r += state.ladder_direction[ladder]) {
+            if (expected_color_for(ladder, r) == color) {
+                ++remaining;
+            }
         }
-        return state.next_needed[color];
     }
-    if (state.ladder_direction[color] > 0) {
-        return state.next_needed[color];
-    }
-    return 14 - state.next_needed[color];
-}
-
-void set_forced_start(GameState& state, int color, int rank) {
-    state.forced_start[color] = rank;
-    if (!state.ladder_started[color]) {
-        state.next_needed[color] = rank;
-        state.ladder_direction[color] = (rank == 13) ? -1 : 1;
-    }
+    return remaining;
 }
 
 void advance_ladder(GameState& state, int color, int rank_played) {
-    if (!state.ladder_started[color]) {
-        if (state.ladder_direction[color] == 0) {
-            state.ladder_direction[color] = (rank_played == 13) ? -1 : 1;
-        } else {
-            if (state.ladder_direction[color] == 1) {
-                assert(rank_played == 1);
-            } else {
-                assert(rank_played == 13);
-            }
-        }
-        state.ladder_started[color] = true;
-        state.forced_start[color] = 0;
-        state.next_needed[color] = rank_played + state.ladder_direction[color];
-
-        int other = 1 - color;
-        if (!state.ladder_started[other]) {
-            int forced = (state.ladder_direction[color] == 1) ? 13 : 1;
-            set_forced_start(state, other, forced);
-        }
-    } else {
-        assert(is_current_need(state, color, rank_played));
-        state.next_needed[color] += state.ladder_direction[color];
-    }
+    int ladder = ladder_for(color, rank_played);
+    assert(!ladder_completed(state, ladder));
+    assert(state.next_needed[ladder] == rank_played);
+    state.ladder_started[ladder] = true;
+    state.next_needed[ladder] += state.ladder_direction[ladder];
 }
 
 bool all_ladders_completed(const GameState& state) {
@@ -273,10 +246,9 @@ GameState initialise_game(const Settings& cfg, std::mt19937_64& rng) {
         std::shuffle(state.deck[p].begin(), state.deck[p].end(), rng);
     }
 
-    state.next_needed = {1, 1};
-    state.ladder_direction = {0, 0};
+    state.next_needed = {1, 13};
+    state.ladder_direction = {1, -1};
     state.ladder_started = {false, false};
-    state.forced_start = {0, 0};
     state.ace_started = false;
     state.turns = 0;
     state.hand_limit = {cfg.hand_size, cfg.hand_size};
@@ -582,12 +554,13 @@ bool protect_future_rank(GameState& state, int player, std::string& action) {
 // Post-commit ascending (+1 from Ace): prefer DISCARDING high tail (K,Q,...) first.
 // Post-commit descending (-1 from King): prefer DISCARDING low tail (A,2,...) first.
 static inline int rank_discard_priority(const GameState& state, int color, int rank) {
-    if (!state.ladder_started[color]) {
+    int ladder = ladder_for(color, rank);
+    if (!state.ladder_started[ladder]) {
         // Center-out: 7 -> 0, 6/8 -> 1, 5/9 -> 2, ...
         return std::abs(rank - 7);
     }
     // Tail-in after commitment:
-    if (state.ladder_direction[color] > 0) {
+    if (state.ladder_direction[ladder] > 0) {
         // Ascending from Ace: favor throwing late ranks first (K best -> 0).
         return 13 - rank;
     }
