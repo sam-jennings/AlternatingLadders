@@ -72,13 +72,147 @@ struct GameState {
     std::array<std::vector<int>, 28> market;  // [color*14 + rank], ranks 1..13 used
     std::vector<int> trash;                   // irretrievable discards
 
-    std::array<int, 2> next_needed;  // next required rank per colour
+    std::array<int, 2> next_needed;  // next required rank per colour/ladder
+    std::array<int, 2> ladder_direction;  // +1 ascending from Ace, -1 descending from King, 0 undecided
+    std::array<bool, 2> ladder_started;   // has the ladder for this colour begun?
+    std::array<int, 2> forced_start;      // required initial rank when ladder not yet started (0 = free choice)
     bool ace_started = false;        // has any Ace been played?
     int turns = 0;                   // number of turns elapsed
     std::array<int, 2> hand_limit;   // dynamic per-player hand limits
     int consecutive_skips = 0;       // consecutive skip-forced turns
     int total_skips = 0;             // total skips executed this game
 };
+
+bool ladder_completed(const GameState& state, int color) {
+    if (!state.ladder_started[color]) {
+        return false;
+    }
+    if (state.ladder_direction[color] > 0) {
+        return state.next_needed[color] > 13;
+    }
+    return state.next_needed[color] < 1;
+}
+
+std::vector<int> current_required_ranks(const GameState& state, int color) {
+    if (ladder_completed(state, color)) {
+        return {};
+    }
+    if (state.ladder_started[color]) {
+        return {state.next_needed[color]};
+    }
+    if (state.forced_start[color] != 0) {
+        return {state.forced_start[color]};
+    }
+    return {1, 13};
+}
+
+std::vector<int> remaining_ranks(const GameState& state, int color) {
+    std::vector<int> ranks;
+    if (ladder_completed(state, color)) {
+        return ranks;
+    }
+    if (state.ladder_started[color]) {
+        if (state.ladder_direction[color] > 0) {
+            for (int r = state.next_needed[color]; r <= 13; ++r) {
+                ranks.push_back(r);
+            }
+        } else {
+            for (int r = state.next_needed[color]; r >= 1; --r) {
+                ranks.push_back(r);
+            }
+        }
+    } else {
+        if (state.forced_start[color] == 13) {
+            for (int r = 13; r >= 1; --r) {
+                ranks.push_back(r);
+            }
+        } else {
+            for (int r = 1; r <= 13; ++r) {
+                ranks.push_back(r);
+            }
+        }
+    }
+    return ranks;
+}
+
+bool is_current_need(const GameState& state, int color, int rank) {
+    for (int required : current_required_ranks(state, color)) {
+        if (required == rank) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_future_need(const GameState& state, int color, int rank) {
+    if (rank < 1 || rank > 13) {
+        return false;
+    }
+    if (ladder_completed(state, color)) {
+        return false;
+    }
+    if (state.ladder_started[color]) {
+        if (state.ladder_direction[color] > 0) {
+            return rank >= state.next_needed[color];
+        }
+        return rank <= state.next_needed[color];
+    }
+    if (state.forced_start[color] == 13) {
+        return rank <= 13;
+    }
+    return rank >= 1;
+}
+
+int progress_metric(const GameState& state, int color) {
+    if (!state.ladder_started[color]) {
+        if (state.forced_start[color] == 13) {
+            return 1;
+        }
+        return state.next_needed[color];
+    }
+    if (state.ladder_direction[color] > 0) {
+        return state.next_needed[color];
+    }
+    return 14 - state.next_needed[color];
+}
+
+void set_forced_start(GameState& state, int color, int rank) {
+    state.forced_start[color] = rank;
+    if (!state.ladder_started[color]) {
+        state.next_needed[color] = rank;
+        state.ladder_direction[color] = (rank == 13) ? -1 : 1;
+    }
+}
+
+void advance_ladder(GameState& state, int color, int rank_played) {
+    if (!state.ladder_started[color]) {
+        if (state.ladder_direction[color] == 0) {
+            state.ladder_direction[color] = (rank_played == 13) ? -1 : 1;
+        } else {
+            if (state.ladder_direction[color] == 1) {
+                assert(rank_played == 1);
+            } else {
+                assert(rank_played == 13);
+            }
+        }
+        state.ladder_started[color] = true;
+        state.forced_start[color] = 0;
+        state.next_needed[color] = rank_played + state.ladder_direction[color];
+
+        int other = 1 - color;
+        if (!state.ladder_started[other]) {
+            int forced = (state.ladder_direction[color] == 1) ? 13 : 1;
+            set_forced_start(state, other, forced);
+        }
+    } else {
+        assert(is_current_need(state, color, rank_played));
+        state.next_needed[color] += state.ladder_direction[color];
+    }
+}
+
+bool all_ladders_completed(const GameState& state) {
+    return ladder_completed(state, 0) && ladder_completed(state, 1);
+}
 
 // Utility: remove a card id from a vector (order is not preserved but we keep
 // deterministic behaviour by erasing via iterator).
@@ -140,6 +274,9 @@ GameState initialise_game(const Settings& cfg, std::mt19937_64& rng) {
     }
 
     state.next_needed = {1, 1};
+    state.ladder_direction = {0, 0};
+    state.ladder_started = {false, false};
+    state.forced_start = {0, 0};
     state.ace_started = false;
     state.turns = 0;
     state.hand_limit = {cfg.hand_size, cfg.hand_size};
@@ -218,7 +355,7 @@ bool other_copy_in_trash(const GameState& state, int color, int rank, int owner)
 // failing pair if unwinnable, std::nullopt otherwise.
 std::optional<std::pair<int, int>> detect_unwinnable(const GameState& state) {
     for (int color = 0; color < 2; ++color) {
-        for (int rank = state.next_needed[color]; rank <= 13; ++rank) {
+        for (int rank : remaining_ranks(state, color)) {
             bool lost0 = false;
             bool lost1 = false;
             for (size_t i = 0; i < state.cards.size(); ++i) {
@@ -247,26 +384,27 @@ std::optional<std::pair<int, int>> detect_unwinnable(const GameState& state) {
 // shared areas (reserve/market).
 bool can_play_now(const GameState& state, int player, bool allow_market) {
     for (int color = 0; color < 2; ++color) {
-        int rank = state.next_needed[color];
-        if (rank > 13) {
-            continue;
-        }
-        if (allow_market) {
-            const auto& pile = state.market[market_index(color, rank)];
-            if (!pile.empty()) {
-                return true;
+        for (int rank : current_required_ranks(state, color)) {
+            if (rank < 1 || rank > 13) {
+                continue;
             }
-        }
-        for (int card_id : state.reserve) {
-            const Card& c = state.cards[card_id];
-            if (c.color == color && c.rank == rank) {
-                return true;
+            if (allow_market) {
+                const auto& pile = state.market[market_index(color, rank)];
+                if (!pile.empty()) {
+                    return true;
+                }
             }
-        }
-        for (int card_id : state.hand[player]) {
-            const Card& c = state.cards[card_id];
-            if (c.color == color && c.rank == rank) {
-                return true;
+            for (int card_id : state.reserve) {
+                const Card& c = state.cards[card_id];
+                if (c.color == color && c.rank == rank) {
+                    return true;
+                }
+            }
+            for (int card_id : state.hand[player]) {
+                const Card& c = state.cards[card_id];
+                if (c.color == color && c.rank == rank) {
+                    return true;
+                }
             }
         }
     }
@@ -290,27 +428,28 @@ void play_from_best_source(GameState& state, int player, bool allow_market,
                            std::string& action) {
     std::vector<PlayCandidate> candidates;
     for (int color = 0; color < 2; ++color) {
-        int rank = state.next_needed[color];
-        if (rank > 13) {
-            continue;
-        }
-        if (allow_market) {
-            auto idx = market_index(color, rank);
-            for (int card_id : state.market[idx]) {
+        for (int rank : current_required_ranks(state, color)) {
+            if (rank < 1 || rank > 13) {
+                continue;
+            }
+            if (allow_market) {
+                auto idx = market_index(color, rank);
+                for (int card_id : state.market[idx]) {
+                    const Card& c = state.cards[card_id];
+                    candidates.push_back({card_id, color, rank, 0, c.owner});
+                }
+            }
+            for (int card_id : state.reserve) {
                 const Card& c = state.cards[card_id];
-                candidates.push_back({card_id, color, rank, 0, c.owner});
+                if (c.color == color && c.rank == rank) {
+                    candidates.push_back({card_id, color, rank, 1, c.owner});
+                }
             }
-        }
-        for (int card_id : state.reserve) {
-            const Card& c = state.cards[card_id];
-            if (c.color == color && c.rank == rank) {
-                candidates.push_back({card_id, color, rank, 1, c.owner});
-            }
-        }
-        for (int card_id : state.hand[player]) {
-            const Card& c = state.cards[card_id];
-            if (c.color == color && c.rank == rank) {
-                candidates.push_back({card_id, color, rank, 2, c.owner});
+            for (int card_id : state.hand[player]) {
+                const Card& c = state.cards[card_id];
+                if (c.color == color && c.rank == rank) {
+                    candidates.push_back({card_id, color, rank, 2, c.owner});
+                }
             }
         }
     }
@@ -369,8 +508,7 @@ void play_from_best_source(GameState& state, int player, bool allow_market,
     state.locations[best.card_id] = {LocationType::Played, -1};
 
     // Advance the ladder.
-    assert(state.next_needed[best.color] == best.rank);
-    state.next_needed[best.color]++;
+    advance_ladder(state, best.color, best.rank);
 
     if (card.rank == 1) {
         state.ace_started = true;
@@ -386,13 +524,13 @@ bool protect_future_rank(GameState& state, int player, std::string& action) {
         return false;
     }
 
-    // Search for the lowest rank >= next_needed[color] where both copies are
+    // Search for the lowest rank still required where both copies are
     // simultaneously visible (in hands/reserve/market) and one of them is in
     // the current player's hand.  We only move from the current player's hand;
     // this respects turn ownership while still following the intent of the
     // policy.
     for (int color = 0; color < 2; ++color) {
-        for (int rank = state.next_needed[color]; rank <= 13; ++rank) {
+        for (int rank : remaining_ranks(state, color)) {
             bool other_visible = false;
             bool other_safe = false;
             // Locate the other copy and check visibility.
@@ -446,10 +584,12 @@ int choose_discard(const GameState& state, int player) {
         return -1;
     }
 
-    int preferred_color = -1;  // colour to protect (smaller next needed rank)
-    if (state.next_needed[0] < state.next_needed[1]) {
+    int preferred_color = -1;  // colour to protect (smaller progress metric)
+    int metric0 = progress_metric(state, 0);
+    int metric1 = progress_metric(state, 1);
+    if (metric0 < metric1) {
         preferred_color = 0;
-    } else if (state.next_needed[1] < state.next_needed[0]) {
+    } else if (metric1 < metric0) {
         preferred_color = 1;
     }
 
@@ -496,11 +636,11 @@ int choose_discard(const GameState& state, int player) {
     std::vector<Candidate> critical;
     for (int card_id : hand) {
         const Card& c = state.cards[card_id];
-        if (c.rank == state.next_needed[c.color]) {
+        if (is_current_need(state, c.color, c.rank)) {
             continue;  // keep this rank if we can
         }
         bool is_critical = false;
-        if (c.rank >= state.next_needed[c.color]) {
+        if (is_future_need(state, c.color, c.rank)) {
             is_critical = other_copy_in_trash(state, c.color, c.rank, c.owner);
         }
         if (is_critical) {
@@ -523,7 +663,7 @@ int choose_discard(const GameState& state, int player) {
     for (int card_id : hand) {
         const Card& c = state.cards[card_id];
         bool is_critical = false;
-        if (c.rank >= state.next_needed[c.color]) {
+        if (is_future_need(state, c.color, c.rank)) {
             is_critical = other_copy_in_trash(state, c.color, c.rank, c.owner);
         }
         if (is_critical) {
@@ -632,9 +772,34 @@ TrialResult play_single_game(const Settings& cfg, std::mt19937_64& rng, bool tra
         if (!trace_output) {
             return;
         }
+        auto describe_next = [&](int color) {
+            auto required = current_required_ranks(state, color);
+            if (required.empty()) {
+                return std::string("-");
+            }
+            std::ostringstream oss;
+            for (size_t i = 0; i < required.size(); ++i) {
+                if (i) {
+                    oss << '/';
+                }
+                int rank = required[i];
+                if (rank == 1) {
+                    oss << 'A';
+                } else if (rank == 11) {
+                    oss << 'J';
+                } else if (rank == 12) {
+                    oss << 'Q';
+                } else if (rank == 13) {
+                    oss << 'K';
+                } else {
+                    oss << rank;
+                }
+            }
+            return oss.str();
+        };
         std::cout << preface << "\n";
-        std::cout << "  Next needed: R" << state.next_needed[0]
-                  << " B" << state.next_needed[1] << "\n";
+        std::cout << "  Next needed: R" << describe_next(0)
+                  << " B" << describe_next(1) << "\n";
         std::cout << "  Hand A: " << describe_cards(state, state.hand[0]) << "\n";
         std::cout << "  Hand B: " << describe_cards(state, state.hand[1]) << "\n";
         std::cout << "  Reserve: " << describe_cards(state, state.reserve) << "\n";
@@ -652,7 +817,7 @@ TrialResult play_single_game(const Settings& cfg, std::mt19937_64& rng, bool tra
             result.failure_reason = fail;
             break;
         }
-        if (state.next_needed[0] > 13 && state.next_needed[1] > 13) {
+        if (all_ladders_completed(state)) {
             result.completed = true;
             break;
         }
@@ -764,7 +929,7 @@ TrialResult play_single_game(const Settings& cfg, std::mt19937_64& rng, bool tra
             result.failure_reason = fail_after;
             break;
         }
-        if (state.next_needed[0] > 13 && state.next_needed[1] > 13) {
+        if (all_ladders_completed(state)) {
             result.completed = true;
             break;
         }
