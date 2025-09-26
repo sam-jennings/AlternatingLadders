@@ -577,105 +577,114 @@ bool protect_future_rank(GameState& state, int player, std::string& action) {
     return false;
 }
 
-// Choose a card to discard from the current player's hand following the policy.
+// Rank priority by phase: smaller return value = better discard candidate.
+// Pre-commit: prefer DISCARDING central ranks (6/7/8) first: |rank-7| small.
+// Post-commit ascending (+1 from Ace): prefer DISCARDING high tail (K,Q,...) first.
+// Post-commit descending (-1 from King): prefer DISCARDING low tail (A,2,...) first.
+static inline int rank_discard_priority(const GameState& state, int color, int rank) {
+    if (!state.ladder_started[color]) {
+        // Center-out: 7 -> 0, 6/8 -> 1, 5/9 -> 2, ...
+        return std::abs(rank - 7);
+    }
+    // Tail-in after commitment:
+    if (state.ladder_direction[color] > 0) {
+        // Ascending from Ace: favor throwing late ranks first (K best -> 0).
+        return 13 - rank;
+    }
+    else {
+        // Descending from King: favor throwing early ranks first (A best -> 0).
+        return rank - 1;
+    }
+}
+
+// Choose a card to discard from the current player's hand following the
+// pre/post-commit policy described in the design.
+// - Exclude the currently-needed rank.
+// - Strongly avoid discarding the last live copy of any FUTURE-needed rank.
+// - Before commitment (for that colour) discard center ranks first (6/7/8).
+// - After commitment, discard from the far tail (K.. or A..) that will be last to play.
+// - Prefer discarding from the colour that is LESS progressed (protect the one closer to completion).
 int choose_discard(const GameState& state, int player) {
     const auto& hand = state.hand[player];
-    if (hand.empty()) {
-        return -1;
-    }
+    if (hand.empty()) return -1;
 
-    int preferred_color = -1;  // colour to protect (smaller progress metric)
-    int metric0 = progress_metric(state, 0);
-    int metric1 = progress_metric(state, 1);
-    if (metric0 < metric1) {
-        preferred_color = 0;
-    } else if (metric1 < metric0) {
-        preferred_color = 1;
-    }
+    // Prefer to protect the colour with greater progress (smaller progress_metric).
+    int protect_color = -1;
+    int m0 = progress_metric(state, 0);
+    int m1 = progress_metric(state, 1);
+    if (m0 < m1) protect_color = 0;
+    else if (m1 < m0) protect_color = 1;
 
-    // Collect candidates that satisfy the safest criterion.
-    struct Candidate {
+    struct Scored {
         int card_id;
-        int rank;
         int color;
+        int rank;
+        long long score;
     };
+    std::vector<Scored> candidates;
+    candidates.reserve(hand.size());
 
-    std::vector<Candidate> safe;
     for (int card_id : hand) {
         const Card& c = state.cards[card_id];
-        bool colour_ok = (preferred_color == -1) || (c.color != preferred_color);
-        if (!colour_ok) {
-            continue;
+        int color = c.color;
+        int rank = c.rank;
+
+        // Never discard the currently-needed rank if we can avoid it.
+        if (is_current_need(state, color, rank)) continue;
+
+        // Base priority from phase (pre/post commit).
+        long long score = 0;
+        score += 10LL * rank_discard_priority(state, color, rank);
+
+        // Avoid throwing from the colour we're protecting.
+        if (protect_color == color) score += 5000;
+
+        // FUTURE-need safety: if this rank will be needed and the other copy is already trashed,
+        // this is the last live copy -> make it extremely unattractive to discard.
+        bool future = is_future_need(state, color, rank);
+        if (future && other_copy_in_trash(state, color, rank, c.owner)) {
+            score += 1000000000LL; // effectively a veto unless no alternative
         }
-        if (other_copy_unseen(state, c.color, c.rank, c.owner)) {
-            safe.push_back({card_id, c.rank, c.color});
+
+        // Slight preference to discard ranks whose other copy is UNSEEN (i.e., still somewhere
+        // in the system) rather than visible (and therefore more at risk of being tossed later).
+        if (other_copy_unseen(state, color, rank, c.owner)) {
+            score -= 50; // tiny nudge
         }
+
+        // Tie-breakers to keep behaviour deterministic but sensible.
+        // Prefer discarding from the current player's colour that is less progressed overall:
+        // already captured via protect_color. Next, prefer higher rank within the same priority
+        // to clear tails faster in post-commit, but in pre-commit center metric dominates anyway.
+        score += (color * 2);     // tiny bias: prefer discarding black on ties (optional)
+        score += (rank);          // tiny bias: higher rank on ties
+
+        candidates.push_back({ card_id, color, rank, score });
     }
 
-    auto pick_highest = [](const std::vector<Candidate>& v) {
-        assert(!v.empty());
-        return std::max_element(v.begin(), v.end(),
-                                [](const Candidate& a, const Candidate& b) {
-                                    if (a.rank != b.rank) {
-                                        return a.rank < b.rank;
-                                    }
-                                    if (a.color != b.color) {
-                                        return a.color < b.color;  // prefer black on ties
-                                    }
-                                    return a.card_id < b.card_id;
-                                })
-            ->card_id;
-    };
-
-    if (!safe.empty()) {
-        return pick_highest(safe);
+    if (candidates.empty()) {
+        // All cards are currently-needed (rare). Fall back to discarding the least-bad:
+        // pick the card with the largest base priority metric (i.e., worst to keep).
+        int worst_id = hand.front();
+        long long worst_score = -1;
+        for (int card_id : hand) {
+            const Card& c = state.cards[card_id];
+            long long s = 10LL * rank_discard_priority(state, c.color, c.rank);
+            if (protect_color == c.color) s += 5000;
+            if (s > worst_score) { worst_score = s; worst_id = card_id; }
+        }
+        return worst_id;
     }
 
-    // Risky path: avoid discarding a currently next-needed rank if possible.
-    std::vector<Candidate> risky;
-    std::vector<Candidate> critical;
-    for (int card_id : hand) {
-        const Card& c = state.cards[card_id];
-        if (is_current_need(state, c.color, c.rank)) {
-            continue;  // keep this rank if we can
-        }
-        bool is_critical = false;
-        if (is_future_need(state, c.color, c.rank)) {
-            is_critical = other_copy_in_trash(state, c.color, c.rank, c.owner);
-        }
-        if (is_critical) {
-            critical.push_back({card_id, c.rank, c.color});
-        } else {
-            risky.push_back({card_id, c.rank, c.color});
-        }
-    }
-
-    if (!risky.empty()) {
-        return pick_highest(risky);
-    }
-    if (!critical.empty()) {
-        return pick_highest(critical);
-    }
-
-    // No choice left – discard the highest rank regardless.
-    std::vector<Candidate> everything;
-    std::vector<Candidate> fallback_critical;
-    for (int card_id : hand) {
-        const Card& c = state.cards[card_id];
-        bool is_critical = false;
-        if (is_future_need(state, c.color, c.rank)) {
-            is_critical = other_copy_in_trash(state, c.color, c.rank, c.owner);
-        }
-        if (is_critical) {
-            fallback_critical.push_back({card_id, c.rank, c.color});
-        } else {
-            everything.push_back({card_id, c.rank, c.color});
-        }
-    }
-    if (!everything.empty()) {
-        return pick_highest(everything);
-    }
-    return pick_highest(fallback_critical);
+    // Select the minimum-score candidate.
+    auto it = std::min_element(candidates.begin(), candidates.end(),
+        [](const Scored& a, const Scored& b) {
+            if (a.score != b.score) return a.score < b.score;
+            if (a.color != b.color) return a.color < b.color; // prefer red on ties
+            if (a.rank != b.rank) return a.rank < b.rank;
+            return a.card_id < b.card_id;
+        });
+    return it->card_id;
 }
 
 // Execute a discard, either to reserve (if the caller already decided to move
@@ -1107,17 +1116,6 @@ int main(int argc, char** argv) {
               << " p90=" << quantile(0.9)
               << skip_stats.str() << "\n";
 
-    long double mean_skips = sum_skips / cfg.trials;
-    long double mean_skip_ratio = sum_skip_ratios / cfg.trials;
-    long double overall_skip_fraction =
-        sum_turns > 0 ? sum_skips / sum_turns : 0.0L;
-
-    std::cout << "mean_skips=" << std::setprecision(2)
-              << static_cast<double>(mean_skips)
-              << " mean_skip_ratio=" << std::setprecision(4)
-              << static_cast<double>(mean_skip_ratio)
-              << " overall_skip_fraction=" << static_cast<double>(overall_skip_fraction)
-              << std::setprecision(4) << "\n";
 
     if (!failure_counts.empty()) {
         std::cout << "failures_by_need:";
