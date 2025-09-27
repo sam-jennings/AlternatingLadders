@@ -13,6 +13,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <chrono>
 
 // -----------------------------------------------------------------------------
 // Alternating ladder cooperative game Monte Carlo simulator.
@@ -51,15 +52,17 @@ struct CardLocation {
 };
 
 struct Settings {
-    int64_t trials = 200000;
+    int64_t trials = 500000;
     int hand_size = 5;
     int reserve_capacity = 0;
     bool ace_grace = false;
     bool market_enabled = false;
     bool skip_forced_discard = false;
-    uint64_t seed = 42;
+	uint64_t seed = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()
+        );;
     bool trace = false;
-    bool joker_enabled = false;
+    bool joker_enabled = true;
 };
 
 // Game state containing all mutable components.
